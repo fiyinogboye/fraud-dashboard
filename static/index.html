@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Fraud Detection Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --border: #2a2e37;
+    --text: #e6e8eb; --muted: #8b93a1;
+    --green: #2ecc71; --red: #ff5c5c; --amber: #f5a623; --blue: #4a9eff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text);
+  }
+  header {
+    padding: 18px 24px; border-bottom: 1px solid var(--border);
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  header h1 { font-size: 18px; margin: 0; }
+  .status { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
+  .stats { display: flex; gap: 16px; padding: 16px 24px; flex-wrap: wrap; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 18px; min-width: 140px;
+  }
+  .card .label { font-size: 12px; color: var(--muted); }
+  .card .value { font-size: 24px; font-weight: 600; margin-top: 4px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; position: sticky; top: 0; background: var(--bg); }
+  tbody tr.flagged { background: rgba(255, 92, 92, 0.07); }
+  tbody tr.new { animation: flash 1s ease-out; }
+  @keyframes flash { from { background: rgba(74,158,255,0.25); } to { background: transparent; } }
+  .badge { padding: 2px 8px; border-radius: 20px; font-size: 11px; font-weight: 600; }
+  .badge.flagged { background: rgba(255,92,92,0.15); color: var(--red); }
+  .badge.ok { background: rgba(46,204,113,0.15); color: var(--green); }
+  .conf-bar { width: 60px; height: 6px; background: #2a2e37; border-radius: 3px; overflow: hidden; display:inline-block; vertical-align:middle; margin-right:6px;}
+  .conf-fill { height: 100%; background: var(--amber); }
+  button {
+    border: none; border-radius: 6px; padding: 5px 10px; font-size: 12px; cursor: pointer;
+    margin-right: 4px; font-weight: 600;
+  }
+  .approve { background: rgba(46,204,113,0.15); color: var(--green); }
+  .reject { background: rgba(255,92,92,0.15); color: var(--red); }
+  .decision-label { font-size: 11px; color: var(--muted); }
+  main { padding: 0 24px 40px; max-width: 1200px; margin: 0 auto; }
+  .table-wrap { max-height: 60vh; overflow-y: auto; border: 1px solid var(--border); border-radius: 10px; }
+  .note { color: var(--muted); font-size: 12px; margin: 16px 0 4px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Fraud Detection Dashboard</h1>
+  <div class="status"><span class="dot" id="dot"></span><span id="statusText">connecting…</span></div>
+</header>
+
+<main>
+  <div class="stats">
+    <div class="card"><div class="label">Transactions seen</div><div class="value" id="statTotal">0</div></div>
+    <div class="card"><div class="label">Flagged</div><div class="value" id="statFlagged" style="color:var(--red)">0</div></div>
+    <div class="card"><div class="label">Flag rate</div><div class="value" id="statRate">0%</div></div>
+    <div class="card"><div class="label">Approved / Rejected</div><div class="value" id="statDecisions">0 / 0</div></div>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th><th>Merchant</th><th>Location</th><th>Amount</th>
+          <th>Risk score</th><th>Status</th><th>Analyst action</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </div>
+
+  <p class="note">
+    Model: IsolationForest trained on synthetic "normal" spending patterns (amount, time of day,
+    foreign-location flag, merchant risk). Flags are unsupervised outliers, not ground truth —
+    that's why an analyst approves/rejects each one. Those decisions are the label data a real
+    system would use to retrain nightly.
+  </p>
+</main>
+
+<script>
+let total = 0, flagged = 0, approved = 0, rejected = 0;
+const rowsEl = document.getElementById("rows");
+
+function fmtTime(ts) {
+  return new Date(ts * 1000).toLocaleTimeString();
+}
+
+function renderRow(tx, isNew) {
+  const tr = document.createElement("tr");
+  tr.id = "tx-" + tx.id;
+  if (tx.is_flagged) tr.classList.add("flagged");
+  if (isNew) tr.classList.add("new");
+
+  const badge = tx.is_flagged
+    ? '<span class="badge flagged">FLAGGED</span>'
+    : '<span class="badge ok">normal</span>';
+
+  const pct = Math.round(tx.confidence * 100);
+
+  tr.innerHTML = `
+    <td>${fmtTime(tx.ts)}</td>
+    <td>${tx.merchant}</td>
+    <td>${tx.location}</td>
+    <td>$${tx.amount.toFixed(2)}</td>
+    <td><span class="conf-bar"><span class="conf-fill" style="width:${pct}%"></span></span>${pct}%</td>
+    <td>${badge}</td>
+    <td class="actions">
+      ${tx.is_flagged ? `
+        <button class="approve" onclick="decide('${tx.id}','approved')">Approve</button>
+        <button class="reject" onclick="decide('${tx.id}','rejected')">Reject</button>
+      ` : '<span class="decision-label">—</span>'}
+    </td>
+  `;
+  rowsEl.prepend(tr);
+}
+
+async function decide(id, decision) {
+  await fetch(`/api/decision/${id}/${decision}`, { method: "POST" });
+}
+
+function markDecided(id, decision) {
+  const row = document.getElementById("tx-" + id);
+  if (!row) return;
+  const cell = row.querySelector(".actions");
+  cell.innerHTML = `<span class="decision-label">${decision}</span>`;
+  if (decision === "approved") approved++; else rejected++;
+  document.getElementById("statDecisions").textContent = `${approved} / ${rejected}`;
+}
+
+function updateStats() {
+  document.getElementById("statTotal").textContent = total;
+  document.getElementById("statFlagged").textContent = flagged;
+  document.getElementById("statRate").textContent = total ? Math.round(100*flagged/total) + "%" : "0%";
+}
+
+// Load recent history first
+fetch("/api/history").then(r => r.json()).then(rows => {
+  rows.reverse().forEach(tx => {
+    total++;
+    if (tx.is_flagged) flagged++;
+    if (tx.analyst_decision === "approved") approved++;
+    if (tx.analyst_decision === "rejected") rejected++;
+    renderRow(tx, false);
+  });
+  updateStats();
+  document.getElementById("statDecisions").textContent = `${approved} / ${rejected}`;
+});
+
+// Live WebSocket feed
+const ws = new WebSocket(`ws://${location.host}/ws`);
+ws.onopen = () => {
+  document.getElementById("statusText").textContent = "live";
+};
+ws.onclose = () => {
+  document.getElementById("dot").style.background = "var(--red)";
+  document.getElementById("statusText").textContent = "disconnected";
+};
+ws.onmessage = (event) => {
+  const msg = JSON.parse(event.data);
+  if (msg.type === "transaction") {
+    total++;
+    if (msg.data.is_flagged) flagged++;
+    renderRow(msg.data, true);
+    updateStats();
+  } else if (msg.type === "decision") {
+    markDecided(msg.id, msg.decision);
+  }
+};
+</script>
+
+</body>
+</html>
