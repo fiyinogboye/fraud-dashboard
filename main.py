@@ -1,16 +1,15 @@
 """
 FastAPI backend for the fraud detection dashboard.
 
-Generates a simulated transaction stream, scores each transaction with an
-IsolationForest model, stores results in SQLite, and pushes updates to
-connected clients over a WebSocket.
+Consumes transactions from a Kafka topic (published by producer.py), scores
+each one with an IsolationForest model, stores results in SQLite, and
+pushes updates to connected clients over a WebSocket.
 """
 
 import asyncio
 import json
-import random
 import sqlite3
-import time
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -19,11 +18,12 @@ import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from kafka import KafkaConsumer
 from sklearn.ensemble import IsolationForest
 
 DB_PATH = Path(__file__).parent / "transactions.db"
-MERCHANTS = ["Amazon", "Steam", "Uber", "Walmart", "Shell Gas", "Netflix", "BestBuy", "Delta Airlines"]
-LOCATIONS = ["Toronto,CA", "Hamilton,CA", "New York,US", "Lagos,NG", "London,UK", "Tokyo,JP"]
+KAFKA_BOOTSTRAP = "localhost:9092"
+KAFKA_TOPIC = "transactions"
 
 # ---------------------------------------------------------------------------
 # 1. Train the anomaly model on synthetic "normal" historical data.
@@ -137,42 +137,36 @@ manager = ConnectionManager()
 
 
 # ---------------------------------------------------------------------------
-# 4. The "stream": generates a transaction every ~1-2s and scores it
+# 4. Kafka consumer: reads transactions from the 'transactions' topic and
+#    scores each one as it arrives. KafkaConsumer is a blocking/sync client,
+#    so it runs in a background thread; results are handed back to the
+#    asyncio event loop to be saved and broadcast.
 # ---------------------------------------------------------------------------
 
-async def transaction_generator():
-    while True:
-        await asyncio.sleep(random.uniform(0.8, 2.2))
-
-        amount = round(random.gammavariate(2.0, 40), 2)
-        hour = time.localtime().tm_hour + random.uniform(-0.5, 0.5)
-        foreign = 1 if random.random() < 0.12 else 0
-        merchant_risk = random.uniform(0, 0.3)
-
-        # occasionally inject an obvious outlier so the demo has visible fraud
-        if random.random() < 0.15:
-            amount = round(random.uniform(800, 5000), 2)
-            foreign = 1
-            merchant_risk = random.uniform(0.6, 0.95)
-            hour = random.choice([2, 3, 4])  # odd hours
-
-        is_flagged, confidence = score_transaction(amount, hour, foreign, merchant_risk)
-
+def consume_forever(loop: asyncio.AbstractEventLoop):
+    consumer = KafkaConsumer(
+        KAFKA_TOPIC,
+        bootstrap_servers=KAFKA_BOOTSTRAP,
+        value_deserializer=lambda v: json.loads(v.decode("utf-8")),
+        auto_offset_reset="latest",
+    )
+    for message in consumer:
+        raw = message.value
+        is_flagged, confidence = score_transaction(
+            raw["amount"], raw["hour"], raw["foreign"], raw["merchant_risk"]
+        )
         tx = {
             "id": str(uuid.uuid4())[:8],
-            "ts": time.time(),
-            "amount": amount,
-            "merchant": random.choice(MERCHANTS),
-            "location": random.choice(LOCATIONS),
-            "hour": round(hour, 1),
-            "foreign": foreign,
-            "merchant_risk": round(merchant_risk, 2),
+            **raw,
             "is_flagged": bool(is_flagged),
             "confidence": confidence,
         }
+        asyncio.run_coroutine_threadsafe(handle_scored_transaction(tx), loop)
 
-        save_transaction(tx)
-        await manager.broadcast({"type": "transaction", "data": tx})
+
+async def handle_scored_transaction(tx):
+    save_transaction(tx)
+    await manager.broadcast({"type": "transaction", "data": tx})
 
 
 # ---------------------------------------------------------------------------
@@ -182,9 +176,10 @@ async def transaction_generator():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    task = asyncio.create_task(transaction_generator())
+    loop = asyncio.get_event_loop()
+    consumer_thread = threading.Thread(target=consume_forever, args=(loop,), daemon=True)
+    consumer_thread.start()
     yield
-    task.cancel()
 
 
 app = FastAPI(lifespan=lifespan)
